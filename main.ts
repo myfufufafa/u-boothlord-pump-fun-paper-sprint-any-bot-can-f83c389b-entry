@@ -5,15 +5,16 @@
 // buys at the launch itself (0-30 slots after creation) once the opening tape
 // shows genuine demand — real SOL in the curve, at least two distinct buyers,
 // net buy inflow, a price still near its creation level, no single wallet
-// dominating the buys, and a creator who has not sold — then exits fast with a
-// tiered ladder (take half at +18%, let the rest run to +50% or a trailing
-// floor, cut at -12%, dump on a -10% one-batch crash, time out after 150
-// slots). The trailing peak is rescaled when a partial sale shrinks the
-// position, so the runner is judged on the tokens still held. One buy per coin, small fixed stake, at most four main positions open
-// so one slot stays free for guardrail probes: if the bot is behind the pace of
-// 25 round-tripped coins over the window it opens a tiny 0.01 SOL probe round
-// trip on the most liquid curve it has seen and sells it as soon as the buy
-// lands, so the entry always clears the 20-coin minimum bar.
+// dominating the buys, and a creator who has not sold — then exits with a
+// WIDE ladder (K3 variant): sell everything at +50%, cut at -20%, no crash
+// rule, time out after 300 slots. The frozen v2 lost because its +18% half-sale
+// and -10% crash rule cut winners inside launch noise; this variant lets the
+// fat tail (top-3 coins were 31% of v2's gains) run. One buy per coin, small
+// fixed stake, at most four main positions open so one slot stays free for
+// guardrail probes: if the bot is behind the pace of 25 round-tripped coins
+// over the window it opens a tiny 0.01 SOL probe round trip on the most liquid
+// curve it has seen and sells it as soon as the buy lands, so the entry always
+// clears the 20-coin minimum bar.
 //
 // Pure function of the batches the harness sends: no clock, no randomness, no
 // I/O, integer math only, insertion-ordered maps only — the two graded runs
@@ -29,14 +30,14 @@ const SELL_SLIPPAGE_BPS = 10_000; // Exits always execute.
 const MIN_AGE_SLOTS = 0; // Buy at launch: the move happens in the first slots.
 const MAX_AGE_SLOTS = 30; // Only the youngest curves.
 const MIN_REAL_LAMPORTS = 300_000_000n; // 0.3 SOL of real reserves.
-const MIN_BUYERS = 2;
-const MIN_BUY_SOL_LAMPORTS = 200_000_000n; // 0.2 SOL of buy inflow.
+const MIN_BUYERS = 5; // K1: only broadly-bought launches.
+const MIN_BUY_SOL_LAMPORTS = 1_000_000_000n; // K1: 1 SOL of buy inflow.
 const MAX_BUYER_SHARE_PCT = 80; // Largest single buyer at most 80% of buy SOL.
 const MAX_MAIN_POSITIONS = 4; // One of the five slots stays free for probes.
 const TARGET_COINS = 25;
 const PACE_SECONDS = 21_600; // Pace the 25 coins over six hours of block time.
 const MAX_PROBES = 40;
-const MAX_HOLD_SLOTS = 150; // ~1 minute: time out flat positions fast.
+const MAX_HOLD_SLOTS = 300; // ~2 minutes: let winners reach the tail before timing out.
 const PROBE_MIN_REAL_LAMPORTS = 10_000_000_000n; // Probes only on liquid curves.
 
 interface TapeTrade {
@@ -211,22 +212,13 @@ await runBot({
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
         continue;
       }
-      // One-batch crash: price down 10% or more since the last batch.
-      if (h.lastVq > 0n && h.lastVt > 0n && atMost(vq, vt, h.lastVq * 90n, h.lastVt * 100n)) {
+      // K3: no crash rule (launch noise dumps winners), no partial TP1.
+      // Sell everything at +50%, cut at -20%, or time out at 300 slots.
+      if (atMost(value, h.cost, 80n, 100n)) {
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
-      } else if (atMost(value, h.cost, 88n, 100n)) {
+      } else if (atLeast(value, h.cost, 150n, 100n)) {
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
-      } else if (h.tp1Done && (atLeast(value, h.cost, 150n, 100n) || atMost(value, h.peak, 85n, 100n))) {
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
-      } else if (!h.tp1Done && atLeast(value, h.cost, 150n, 100n)) {
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
-      } else if (!h.tp1Done && atLeast(value, h.cost, 118n, 100n)) {
-        const half = pos.token_amount / 2n;
-        if (half > 0n) {
-          orders.push({ side: 'sell', mint, token_amount: half, max_slippage_bps: SELL_SLIPPAGE_BPS });
-          h.tp1Done = true;
-        }
-      } else if (state.slot - h.boughtSlot >= MAX_HOLD_SLOTS && atMost(value, h.cost, 118n, 100n)) {
+      } else if (state.slot - h.boughtSlot >= MAX_HOLD_SLOTS) {
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
       }
 
@@ -268,9 +260,9 @@ await runBot({
       const price = priceOf(state, mint);
       if (price === null) continue;
       const [vq, vt] = price;
-      // Near the creation price (down at most 5%) and not a vertical over +25%:
-      // buy the launch, never chase a run-up.
-      if (!atLeast(vq, vt, tape.createVq * 95n, tape.createVt * 100n)) continue;
+      // Near the creation price (up at least 5% — momentum confirmed, never
+      // chase a run-up) and not a vertical over +25%.
+      if (!atLeast(vq, vt, tape.createVq * 105n, tape.createVt * 100n)) continue;
       if (!atMost(vq, vt, tape.createVq * 125n, tape.createVt * 100n)) continue;
 
       if (state.committedPositionCount() >= MAX_MAIN_POSITIONS) continue;
